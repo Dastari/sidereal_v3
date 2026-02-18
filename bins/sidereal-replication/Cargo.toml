@@ -1,0 +1,13 @@
+[package]
+name = "sidereal-replication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bevy.workspace = true
+bevy_remote.workspace = true
+sidereal-core = { path = "../../crates/sidereal-core" }
+sidereal-net = { path = "../../crates/sidereal-net" }

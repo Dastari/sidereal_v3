@@ -1,0 +1,11 @@
+[package]
+name = "sidereal-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bevy.workspace = true
+sidereal-core = { path = "../sidereal-core" }
+sidereal-sim-core = { path = "../sidereal-sim-core" }

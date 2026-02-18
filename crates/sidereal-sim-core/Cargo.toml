@@ -1,0 +1,9 @@
+[package]
+name = "sidereal-sim-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sidereal-core = { path = "../sidereal-core" }

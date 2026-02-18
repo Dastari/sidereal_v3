@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/sidereal-core",
+  "crates/sidereal-sim-core",
+  "crates/sidereal-input-map",
+  "crates/sidereal-net",
+  "crates/sidereal-game",
+  "crates/sidereal-persistence",
+  "bins/sidereal-shard",
+  "bins/sidereal-replication",
+  "bins/sidereal-gateway",
+  "bins/sidereal-orchestrator",
+  "bins/sidereal-bg-sim",
+  "bins/sidereal-client",
+  "bins/sidereal-tools",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+authors = ["Sidereal Team"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+bevy = { version = "0.18.0" }
+bevy_remote = "0.18.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.8", features = ["serde", "v4"] }
