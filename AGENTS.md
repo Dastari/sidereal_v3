@@ -23,8 +23,11 @@ If any code change conflicts with docs, update docs in the same change or stop a
 - Clients never authoritatively set world transforms/state.
 - Keep identity crossing boundaries as UUID/entity IDs only (no raw Bevy `Entity` IDs over service boundaries).
 - Keep shared simulation/prediction/gameplay logic in shared crates, not duplicated across client targets.
-- Native and WASM clients are both maintained targets; WASM uses platform-specific network adapters only at the boundary.
-- Browser transport direction is WebRTC-first; WebSocket is optional fallback only.
+- Native and WASM client builds are co-maintained; WASM is never a deferred concern. Both must build and pass quality gates at every change, not just when "the WASM phase" arrives.
+- The client is one workspace member (`crates/sidereal-client`) with a native `[[bin]]` target and a WASM `[lib]` target. There is no separate `sidereal-client-web` crate.
+- Platform branching uses `cfg(target_arch = "wasm32")` only. Never use a cargo feature flag to gate native-vs-WASM code paths; `target_arch` is set automatically by the compiler and cannot be miscombined.
+- WASM uses platform-specific network adapters only at the transport boundary. All gameplay, prediction, reconciliation, and ECS systems are shared and must compile for both targets without conditional compilation.
+- Browser transport direction is WebRTC-first (unreliable/unordered data channels for game state, ordered/reliable channel for session control). WebSocket is allowed only as an explicit fallback. New WASM transport work must not default to WebSocket.
 - Asset delivery is stream-based from backend to client; no standalone HTTP asset file serving.
 - Client cache is MMO-style local cache: single `assets.pak` + companion index/metadata, with checksum/version invalidation.
 - `bevy_remote` inspection endpoints for shard/replication/client must be auth-gated and follow project security defaults.
@@ -38,6 +41,8 @@ If any code change conflicts with docs, update docs in the same change or stop a
   - integration test updates if cross-service behavior changes,
   - doc updates for protocol/runtime/architecture changes.
 - Keep boundaries explicit between crates/services (no persistence/network leakage into gameplay core).
+- When adding or changing client-side code: verify both native and WASM targets still build. If a change breaks the WASM target, fix it in the same PR before marking complete. Do not defer WASM build failures.
+- When adding a new client-side dependency: verify it is either WASM-compatible or correctly gated behind `cfg(not(target_arch = "wasm32"))` with a WASM-compatible alternative also provided.
 
 ## 5. Runtime and Environment Conventions
 
@@ -55,6 +60,14 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
+
+If client code was touched, also verify the WASM target compiles:
+
+```bash
+cargo check -p sidereal-client --target wasm32-unknown-unknown
+```
+
+This requires the WASM target to be installed (`rustup target add wasm32-unknown-unknown`). If the WASM target is not installed in the local environment, note it in the change but do not skip the check in CI.
 
 Run targeted tests for touched crates; run broader integration tests when flow boundaries are impacted.
 

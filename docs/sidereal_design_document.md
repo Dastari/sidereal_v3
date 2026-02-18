@@ -62,9 +62,9 @@ Entry/auth plane:
 
 Client plane:
 
-- `sidereal-client` (native Rust/Bevy target): realtime client with prediction/rollback/interpolation.
+- `sidereal-client` (single workspace member): realtime client with prediction/rollback/interpolation. Builds as a native binary and as a WASM `cdylib` library from the same source. See section 3.3 for architecture details.
 - `sidereal-client` enables `bevy_remote` protocol for local/remote inspection tooling parity with server runtimes.
-- `sidereal-client-web` (WASM/browser target) is a maintained build target and must stay CI-green with shared gameplay/runtime code where platform constraints allow.
+- Both the native binary target and the WASM library target must stay CI-green. Gameplay and simulation code is shared; only the transport adapter and platform init code differ.
 
 ### 3.2 Networking Strategy
 
@@ -80,6 +80,122 @@ Migration rule:
 - keep protocol boundaries explicit even when using framework plugins;
 - avoid big-bang replacement of every channel at once.
 - keep transport adapters thin so simulation/gameplay/prediction code is shared across native and WASM clients.
+
+### 3.3 WebRTC Transport Architecture (WASM/Browser Client)
+
+#### Why WebRTC Data Channels
+
+Browser security policy prohibits raw UDP from WASM contexts. WebRTC data channels are the correct equivalent:
+
+- unordered/unreliable data channels behave like UDP (no head-of-line blocking on game state streams),
+- ordered/reliable data channels behave like TCP (for session control and auth messages),
+- natively supported in all modern browsers without HTTP/3 infrastructure,
+- server-side implementation works entirely in Rust without a TLS reverse proxy in front of game data.
+
+WebSocket is available as a fallback transport but imposes head-of-line blocking across all game state updates and is not the primary path. Agents must not default to WebSocket for new WASM transport work.
+
+#### Connection Lifecycle (Signaling Flow)
+
+WebRTC requires an out-of-band signaling exchange before any data channel is established. The signaling path is a short-lived WebSocket connection to the replication server, not a new service:
+
+1. WASM client authenticates via gateway (`POST /auth/login`) and receives a JWT.
+2. Client opens a WebSocket connection to the replication server signaling endpoint (`/rtc/signal`), presenting the JWT for auth-gating.
+3. Client sends a JSON SDP offer over the signaling WebSocket.
+4. Replication server responds with a JSON SDP answer.
+5. Both sides exchange ICE candidates over the signaling WebSocket until ICE negotiation completes.
+6. The WebRTC peer connection and named data channels are established.
+7. The signaling WebSocket is closed; all subsequent game traffic flows exclusively over the data channels.
+
+The signaling WebSocket is a bootstrapping channel only. It carries no game data. Closing it after the peer connection is live is expected behavior, not an error.
+
+#### Data Channel Model
+
+Two named data channels per client session:
+
+| Channel name | Ordered | Reliable | Purpose                                                     |
+|--------------|---------|----------|-------------------------------------------------------------|
+| `ctrl`       | yes     | yes      | Session auth token delivery, channel negotiation, admin     |
+| `game`       | no      | no       | Tick-indexed input snapshots, game state replication frames |
+
+The `game` channel is intentionally unordered and unreliable. Loss tolerance is handled at the protocol level via tick-indexed input redundancy and the late/early window enforcement in the shard input pipeline. The server never waits on a dropped `game` channel frame.
+
+#### ICE, STUN, and TURN Requirements
+
+- A STUN server is required for ICE candidate gathering. In development, public STUN (e.g., `stun:stun.l.google.com:19302`) is acceptable.
+- A TURN relay server is required in production to handle clients behind symmetric NAT. Without TURN, a meaningful fraction of browser clients cannot establish a direct peer connection.
+- The replication server delivers its ICE server configuration (STUN URLs, TURN URLs, TURN credentials) to the client as part of the signaling handshake response, before the SDP offer is sent.
+- TURN credentials should be time-limited and generated per-session (HMAC-based TURN credential pattern).
+
+#### Server-Side Implementation
+
+The replication server WebRTC listener:
+
+- Exposes a WebSocket signaling endpoint (`/rtc/signal`), auth-gated by session JWT.
+- Uses a Rust WebRTC library (e.g., `webrtc-rs` crate or Lightyear's WebRTC transport adapter, whichever is used by the chosen Lightyear version) to negotiate and accept incoming peer connections.
+- Each accepted data channel pair is mapped to a `player_entity_id` and session, then routed identically to native UDP sessions in the replication input/state pipeline.
+- No game logic path differs based on client transport type. Transport adapters are isolated to the connection layer; the shard and visibility systems are transport-agnostic.
+
+Reference shape for the signaling message contract:
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SignalMsg {
+    IceServers { stun_urls: Vec<String>, turn_urls: Vec<String>, turn_credential: Option<TurnCredential> },
+    Offer { sdp: String },
+    Answer { sdp: String },
+    IceCandidate { candidate: String, sdp_mid: Option<String>, sdp_m_line_index: Option<u16> },
+    Error { reason: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TurnCredential {
+    pub username: String,
+    pub password: String,
+}
+```
+
+#### WASM Client Integration
+
+In the WASM build, the transport adapter:
+
+- Uses browser WebRTC APIs via `web-sys` and `js-sys` bindings.
+- Implements the same `ClientTransport` trait interface as the native UDP adapter so that gameplay, prediction, and reconciliation code remain completely shared.
+- Is selected at runtime by `cfg(target_arch = "wasm32")`, not by a cargo feature flag. The Rust compiler sets `target_arch` automatically when building for the WASM target; no manual feature must be enabled.
+- Lightyear's WASM-compatible WebRTC transport plugin is used if available in the targeted Lightyear version; otherwise a thin adapter wrapping `web-sys` `RtcPeerConnection` is acceptable at the transport boundary layer only.
+
+#### Client Crate Architecture: Single Crate, Dual Targets
+
+A Cargo feature flag (`wasm`) for the client is not the right model. `cfg(target_arch = "wasm32")` is set automatically by the Rust toolchain when targeting WASM and cannot be accidentally miscombined with native builds. Feature flags can.
+
+The client is one workspace member (`crates/sidereal-client`) with both targets declared in its `Cargo.toml`:
+
+```toml
+[[bin]]
+name = "sidereal-client"
+path = "src/main.rs"           # native entry point
+
+[lib]
+name = "sidereal_client_web"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"            # WASM entry point (wasm-bindgen init)
+```
+
+Platform-specific code (transport adapter selection, `wasm-bindgen` init, browser canvas setup) is gated by `#[cfg(target_arch = "wasm32")]`. All gameplay, prediction, reconciliation, UI, and ECS systems live in shared modules with no target conditional.
+
+Build commands:
+
+```bash
+# native
+cargo build -p sidereal-client
+
+# WASM (requires wasm-pack or cargo build with wasm32 target)
+wasm-pack build crates/sidereal-client --target web --out-dir ../../dist/web
+# or
+cargo build -p sidereal-client --target wasm32-unknown-unknown
+```
+
+This replaces the previously listed `bins/sidereal-client-web` binary. There is no separate web binary; the WASM artifact comes from the library target of `crates/sidereal-client`.
 
 ## 4. Tick, Time, and Input Model
 
@@ -538,9 +654,11 @@ Binaries:
 - `bins/sidereal-gateway`
 - `bins/sidereal-orchestrator`
 - `bins/sidereal-bg-sim`
-- `bins/sidereal-client` (primary refactor target)
-- `bins/sidereal-client-web` (WASM/browser target)
 - `bins/sidereal-tools`
+
+Client (single crate, dual targets):
+
+- `crates/sidereal-client`: the client workspace member. Produces a native binary via `[[bin]]` and a WASM `cdylib` library via `[lib]`. There is no separate `sidereal-client-web` crate; the WASM artifact is the library target of this crate. See section 3.3 for rationale and build commands. Platform branching is done with `cfg(target_arch = "wasm32")`, never with cargo feature flags.
 
 Folder layout guidance:
 
@@ -610,6 +728,10 @@ Current notable env vars:
 - `SIDEREAL_CLIENT_TRANSPORT_NATIVE`
 - `SIDEREAL_CLIENT_TRANSPORT_WEB` (target value direction: `webrtc` first, optional `websocket` fallback)
 - `REPLICATION_CONTROL_UDP_BIND` / `REPLICATION_CONTROL_UDP_ADDR`
+- `SIDEREAL_RTC_SIGNAL_BIND`: replication server WebSocket signaling endpoint bind address (e.g., `0.0.0.0:9003`).
+- `SIDEREAL_STUN_URLS`: comma-separated STUN server URLs delivered to clients during signaling (e.g., `stun:stun.l.google.com:19302`).
+- `SIDEREAL_TURN_URLS`: comma-separated TURN server URLs (production required for symmetric NAT clients).
+- `SIDEREAL_TURN_CREDENTIAL_TTL_S`: lifetime in seconds for HMAC-based TURN per-session credentials (default: `3600`).
 
 ## 19. Local Development Setup (From Scratch)
 

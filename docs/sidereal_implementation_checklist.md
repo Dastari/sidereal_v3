@@ -20,7 +20,8 @@ Primary spec: `docs/sidereal_design_document.md`
 - [ ] Enforce lint gates (`fmt`, `clippy -D warnings`, `check`) in CI.
 - [ ] Add `bevy_remote` dependency and shared config scaffolding for `sidereal-shard`, `sidereal-replication`, and `sidereal-client`.
 - [ ] Define auth model + bind defaults for runtime inspection endpoints (disabled unauthenticated access by default).
-- [ ] Add maintained WASM client target scaffolding (`sidereal-client-web`) and keep native+WASM client builds in CI from day 0.
+- [ ] Set up `crates/sidereal-client` as the single client workspace member with both a `[[bin]]` (native, `src/main.rs`) and a `[lib]` with `crate-type = ["cdylib", "rlib"]` (WASM, `src/lib.rs`). Do not create a separate `sidereal-client-web` crate. Platform branching is `cfg(target_arch = "wasm32")`; no cargo feature flag for WASM.
+- [ ] Add both native and WASM build checks to CI from day 0: `cargo check -p sidereal-client` and `cargo check -p sidereal-client --target wasm32-unknown-unknown`. The WASM target must never be left broken between PRs.
 - [ ] Define shared-code boundary rules so native and WASM clients reuse gameplay/prediction/sim crates and differ only at platform/network adapter layers.
 - [ ] Add baseline test harness structure:
   - `crates/*/tests/` for crate unit/integration tests,
@@ -121,8 +122,14 @@ Integration tests required:
 
 ## Phase 5: Client Prediction and Rendering (`sidereal-client`)
 
-- [ ] Implement native client transport and session handshake.
-- [ ] Implement WASM client transport/session handshake using shared client runtime logic and browser-specific network adapter.
+- [ ] Implement native client transport and session handshake (UDP via Lightyear adapter).
+- [ ] Implement WASM client WebRTC transport adapter in `sidereal-client` under `cfg(target_arch = "wasm32")`:
+  - [ ] Signaling: open a JWT-authed WebSocket to `/rtc/signal` on the replication server.
+  - [ ] Receive ICE server config (STUN/TURN URLs) from replication in first signaling message.
+  - [ ] Exchange SDP offer/answer and ICE candidates over the signaling WebSocket.
+  - [ ] Open named data channels (`ctrl`: ordered/reliable; `game`: unordered/unreliable) on the established peer connection.
+  - [ ] Close the signaling WebSocket after data channels are open.
+  - [ ] Implement the same `ClientTransport` trait as the native adapter; no gameplay code diverges.
 - [ ] Implement controlled-entity prediction with input history.
 - [ ] Implement rollback + reconciliation using server ack tick.
 - [ ] Implement correction smoothing/error budget policy.
