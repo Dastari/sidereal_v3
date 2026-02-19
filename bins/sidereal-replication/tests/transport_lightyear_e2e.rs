@@ -1,0 +1,175 @@
+use postgres::{Client, NoTls};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn test_database_url() -> String {
+    std::env::var("SIDEREAL_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("REPLICATION_DATABASE_URL"))
+        .unwrap_or_else(|_| "postgres://sidereal:sidereal@127.0.0.1:5432/sidereal".to_string())
+}
+
+fn ensure_test_db_available() -> bool {
+    Client::connect(&test_database_url(), NoTls).is_ok()
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root should resolve")
+}
+
+fn target_debug_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(dir).join("debug")
+    } else {
+        workspace_root().join("target/debug")
+    }
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral UDP port")
+        .local_addr()
+        .expect("ephemeral addr")
+        .port()
+}
+
+fn spawn_logged(mut cmd: Command) -> (Child, Arc<Mutex<String>>) {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("process should spawn");
+    let stdout = child.stdout.take().expect("stdout pipe should exist");
+    let stderr = child.stderr.take().expect("stderr pipe should exist");
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let out_buffer = Arc::clone(&buffer);
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let mut guard = out_buffer.lock().expect("stdout buffer lock");
+            guard.push_str(&line);
+            guard.push('\n');
+        }
+    });
+    let err_buffer = Arc::clone(&buffer);
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let mut guard = err_buffer.lock().expect("stderr buffer lock");
+            guard.push_str(&line);
+            guard.push('\n');
+        }
+    });
+    (child, buffer)
+}
+
+fn wait_for_log(buffer: &Arc<Mutex<String>>, pattern: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if buffer.lock().expect("log buffer lock").contains(pattern) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn replication_client_lightyear_transport_flow() {
+    if !ensure_test_db_available() {
+        eprintln!("skipping transport e2e test; postgres unavailable");
+        return;
+    }
+
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build",
+            "-p",
+            "sidereal-replication",
+            "-p",
+            "sidereal-client",
+        ])
+        .status()
+        .expect("cargo build should run");
+    assert!(status.success(), "cargo build failed for transport e2e");
+
+    let bin_dir = target_debug_dir();
+    let replication_bin = bin_dir.join("sidereal-replication");
+    let client_bin = bin_dir.join("sidereal-client");
+    assert!(
+        replication_bin.exists(),
+        "missing binary: {replication_bin:?}"
+    );
+    assert!(client_bin.exists(), "missing binary: {client_bin:?}");
+
+    let replication_udp_port = free_udp_port();
+    let control_udp_port = free_udp_port();
+    let client_udp_port = free_udp_port();
+    let replication_udp_addr = format!("127.0.0.1:{replication_udp_port}");
+    let control_udp_addr = format!("127.0.0.1:{control_udp_port}");
+    let client_udp_addr = format!("127.0.0.1:{client_udp_port}");
+
+    let mut rep_cmd = Command::new(&replication_bin);
+    rep_cmd
+        .env("REPLICATION_UDP_BIND", &replication_udp_addr)
+        .env("REPLICATION_CONTROL_UDP_BIND", &control_udp_addr)
+        .env("REPLICATION_DATABASE_URL", test_database_url())
+        .env("RUST_LOG", "info");
+    let (mut rep_child, rep_log) = spawn_logged(rep_cmd);
+
+    assert!(
+        wait_for_log(
+            &rep_log,
+            "replication lightyear UDP server starting",
+            Duration::from_secs(15),
+        ),
+        "replication did not start:\n{}",
+        rep_log.lock().expect("rep log lock"),
+    );
+
+    let mut client_cmd = Command::new(&client_bin);
+    client_cmd
+        .env("SIDEREAL_CLIENT_HEADLESS", "1")
+        .env("REPLICATION_UDP_ADDR", &replication_udp_addr)
+        .env("CLIENT_UDP_BIND", &client_udp_addr)
+        .env("RUST_LOG", "info");
+    let (mut client_child, client_log) = spawn_logged(client_cmd);
+
+    let client_connected_ok = wait_for_log(
+        &client_log,
+        "native client lightyear transport connected",
+        Duration::from_secs(20),
+    );
+    let client_input_ok = wait_for_log(
+        &rep_log,
+        "replication received client input:",
+        Duration::from_secs(20),
+    );
+
+    stop_child(&mut client_child);
+    stop_child(&mut rep_child);
+    assert!(
+        client_connected_ok,
+        "native client did not connect.\nclient log:\n{}",
+        client_log.lock().expect("client log lock"),
+    );
+    assert!(
+        client_input_ok,
+        "replication did not ingest client input.\nreplication log:\n{}\nclient log:\n{}",
+        rep_log.lock().expect("rep log lock"),
+        client_log.lock().expect("client log lock"),
+    );
+}

@@ -55,7 +55,9 @@ impl RemoteInspectConfig {
         }
         match self.auth_token.as_ref() {
             Some(token) if token.len() >= 16 => Ok(()),
-            Some(_) => Err("BRP auth token must be at least 16 characters when BRP is enabled".into()),
+            Some(_) => {
+                Err("BRP auth token must be at least 16 characters when BRP is enabled".into())
+            }
             None => Err("BRP auth token is required when BRP is enabled".into()),
         }
     }
@@ -63,10 +65,10 @@ impl RemoteInspectConfig {
 
 fn first_present_env(keys: &[String]) -> Option<String> {
     for key in keys {
-        if let Ok(value) = env::var(key) {
-            if !value.trim().is_empty() {
-                return Some(value);
-            }
+        if let Ok(value) = env::var(key)
+            && !value.trim().is_empty()
+        {
+            return Some(value);
         }
     }
     None

@@ -1,0 +1,260 @@
+use postgres::{Client, NoTls};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+use uuid::Uuid;
+
+const BOOTSTRAP_KIND: &str = "bootstrap_player";
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapWireMessage {
+    pub kind: String,
+    pub account_id: String,
+    pub player_entity_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapCommand {
+    pub account_id: Uuid,
+    pub player_entity_id: String,
+}
+
+impl TryFrom<BootstrapWireMessage> for BootstrapCommand {
+    type Error = BootstrapError;
+
+    fn try_from(value: BootstrapWireMessage) -> Result<Self, Self::Error> {
+        if value.kind != BOOTSTRAP_KIND {
+            return Err(BootstrapError::Validation(format!(
+                "unknown bootstrap kind: {}",
+                value.kind
+            )));
+        }
+        let account_id = Uuid::parse_str(&value.account_id)
+            .map_err(|_| BootstrapError::Validation("invalid account_id uuid".to_string()))?;
+        let expected_player_entity_id = format!("player:{account_id}");
+        if value.player_entity_id != expected_player_entity_id {
+            return Err(BootstrapError::Validation(
+                "player_entity_id must match player:<account_uuid>".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            account_id,
+            player_entity_id: value.player_entity_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapHandleResult {
+    pub account_id: Uuid,
+    pub player_entity_id: String,
+    pub applied: bool,
+}
+
+pub trait BootstrapStore {
+    fn ensure_schema(&mut self) -> Result<(), BootstrapError>;
+    fn apply_bootstrap_if_absent(
+        &mut self,
+        command: &BootstrapCommand,
+    ) -> Result<bool, BootstrapError>;
+}
+
+pub struct BootstrapProcessor<S: BootstrapStore> {
+    store: S,
+}
+
+impl<S: BootstrapStore> BootstrapProcessor<S> {
+    pub fn new(mut store: S) -> Result<Self, BootstrapError> {
+        store.ensure_schema()?;
+        Ok(Self { store })
+    }
+
+    pub fn handle_payload(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<BootstrapHandleResult, BootstrapError> {
+        let message: BootstrapWireMessage = serde_json::from_slice(payload)
+            .map_err(|err| BootstrapError::Serialization(err.to_string()))?;
+        let command = BootstrapCommand::try_from(message)?;
+        let applied = self.store.apply_bootstrap_if_absent(&command)?;
+        Ok(BootstrapHandleResult {
+            account_id: command.account_id,
+            player_entity_id: command.player_entity_id,
+            applied,
+        })
+    }
+}
+
+pub struct PostgresBootstrapStore {
+    client: Client,
+}
+
+impl PostgresBootstrapStore {
+    pub fn connect(database_url: &str) -> Result<Self, BootstrapError> {
+        let client = Client::connect(database_url, NoTls)
+            .map_err(|err| BootstrapError::Storage(format!("postgres connect failed: {err}")))?;
+        Ok(Self { client })
+    }
+}
+
+impl BootstrapStore for PostgresBootstrapStore {
+    fn ensure_schema(&mut self) -> Result<(), BootstrapError> {
+        self.client
+            .batch_execute(
+                "
+                CREATE TABLE IF NOT EXISTS replication_player_bootstrap (
+                    account_id UUID PRIMARY KEY,
+                    player_entity_id TEXT NOT NULL,
+                    applied_at_epoch_s BIGINT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS replication_bootstrap_events (
+                    event_id BIGSERIAL PRIMARY KEY,
+                    account_id UUID NOT NULL,
+                    player_entity_id TEXT NOT NULL,
+                    applied BOOLEAN NOT NULL,
+                    received_at_epoch_s BIGINT NOT NULL
+                );
+                ",
+            )
+            .map_err(|err| BootstrapError::Storage(format!("schema ensure failed: {err}")))
+    }
+
+    fn apply_bootstrap_if_absent(
+        &mut self,
+        command: &BootstrapCommand,
+    ) -> Result<bool, BootstrapError> {
+        let now = now_epoch_s() as i64;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| BootstrapError::Storage(format!("transaction begin failed: {err}")))?;
+
+        let inserted = tx
+            .query_opt(
+                "
+                INSERT INTO replication_player_bootstrap (account_id, player_entity_id, applied_at_epoch_s)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (account_id) DO NOTHING
+                RETURNING account_id
+                ",
+                &[&command.account_id, &command.player_entity_id, &now],
+            )
+            .map_err(|err| BootstrapError::Storage(format!("bootstrap upsert failed: {err}")))?
+            .is_some();
+
+        tx.execute(
+            "
+            INSERT INTO replication_bootstrap_events (account_id, player_entity_id, applied, received_at_epoch_s)
+            VALUES ($1, $2, $3, $4)
+            ",
+            &[&command.account_id, &command.player_entity_id, &inserted, &now],
+        )
+        .map_err(|err| BootstrapError::Storage(format!("event insert failed: {err}")))?;
+
+        tx.commit()
+            .map_err(|err| BootstrapError::Storage(format!("transaction commit failed: {err}")))?;
+        Ok(inserted)
+    }
+}
+
+#[derive(Default)]
+pub struct InMemoryBootstrapStore {
+    applied_accounts: HashSet<Uuid>,
+    events: Vec<BootstrapHandleResult>,
+}
+
+impl InMemoryBootstrapStore {
+    pub fn events(&self) -> &[BootstrapHandleResult] {
+        &self.events
+    }
+}
+
+impl BootstrapStore for InMemoryBootstrapStore {
+    fn ensure_schema(&mut self) -> Result<(), BootstrapError> {
+        Ok(())
+    }
+
+    fn apply_bootstrap_if_absent(
+        &mut self,
+        command: &BootstrapCommand,
+    ) -> Result<bool, BootstrapError> {
+        let applied = self.applied_accounts.insert(command.account_id);
+        self.events.push(BootstrapHandleResult {
+            account_id: command.account_id,
+            player_entity_id: command.player_entity_id.clone(),
+            applied,
+        });
+        Ok(applied)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error("{0}")]
+    Validation(String),
+    #[error("{0}")]
+    Serialization(String),
+    #[error("{0}")]
+    Storage(String),
+}
+
+fn now_epoch_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(account_id: Uuid) -> Vec<u8> {
+        let raw = format!(
+            r#"{{"kind":"bootstrap_player","account_id":"{}","player_entity_id":"player:{}"}}"#,
+            account_id, account_id
+        );
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn bootstrap_processor_is_idempotent_per_account() {
+        let store = InMemoryBootstrapStore::default();
+        let mut processor = BootstrapProcessor::new(store).expect("processor");
+        let account_id = Uuid::new_v4();
+
+        let first = processor
+            .handle_payload(&payload(account_id))
+            .expect("first");
+        let second = processor
+            .handle_payload(&payload(account_id))
+            .expect("second");
+
+        assert!(first.applied);
+        assert!(!second.applied);
+    }
+
+    #[test]
+    fn bootstrap_processor_rejects_invalid_player_mapping() {
+        let store = InMemoryBootstrapStore::default();
+        let mut processor = BootstrapProcessor::new(store).expect("processor");
+        let account_id = Uuid::new_v4();
+        let bad = format!(
+            r#"{{"kind":"bootstrap_player","account_id":"{}","player_entity_id":"player:wrong"}}"#,
+            account_id
+        );
+
+        let err = processor
+            .handle_payload(bad.as_bytes())
+            .expect_err("expected validation error");
+        match err {
+            BootstrapError::Validation(message) => {
+                assert!(message.contains("player_entity_id"));
+            }
+            _ => panic!("expected validation error"),
+        }
+    }
+}

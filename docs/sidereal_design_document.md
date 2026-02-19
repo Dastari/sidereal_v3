@@ -15,6 +15,12 @@ Core game loop:
 - Observe and interact with entities under strict server-authorized visibility rules.
 - Persist world evolution through authoritative shard simulation and durability pipelines.
 
+Near-term execution focus (current):
+
+- Deliver a deterministic vertical slice from register/login UI to in-world starter ship control.
+- Keep transport and persistence contracts stable while this slice is hardened (`gateway -> replication bootstrap`, `shard -> replication delta ingress`, `client <- replication state`).
+- Preserve native/WASM single-client parity gates even while native remains the primary runtime target.
+
 Primary near-term target:
 
 - stable realtime multiplayer with robust client prediction/reconciliation,
@@ -32,7 +38,7 @@ Technology baseline (target):
 
 ## 2. Hard Invariants (Non-Negotiable)
 
-1. Authority direction is one-way: `client input -> shard simulation -> replication/distribution -> persistence graph`.
+1. Authority direction is one-way. Current simplified mode: `client input -> replication simulation -> persistence graph`. Future multi-shard mode: `client input -> shard simulation -> replication/distribution -> persistence graph`.
 2. Clients send intent/input only; clients never authoritatively set transforms.
 3. Cross-boundary identity is UUID/entity_id only; Bevy `Entity` is runtime-local and never persisted/transmitted.
 4. Runtime shard memory is authoritative live state; DB is durability + startup hydration only.
@@ -52,8 +58,8 @@ Control plane:
 
 Data plane:
 
-- `sidereal-shard` (N instances): authoritative ECS + Avian simulation at fixed tick.
-- `sidereal-replication`: client-facing replication server, visibility filtering, fan-out, durability staging, input routing to shard ownership.
+- `sidereal-replication`: current authoritative ECS + Avian simulation host, client-facing transport, visibility filtering, fan-out, and durability staging.
+- `sidereal-shard` (N instances): reserved for future multi-shard split/ownership and lease routing.
 - `sidereal-shard` and `sidereal-replication` expose `bevy_remote` protocol endpoints for authenticated runtime world inspection.
 
 Entry/auth plane:
@@ -80,6 +86,8 @@ Migration rule:
 - keep protocol boundaries explicit even when using framework plugins;
 - avoid big-bang replacement of every channel at once.
 - keep transport adapters thin so simulation/gameplay/prediction code is shared across native and WASM clients.
+- current implementation baseline: replication and native client run Lightyear raw UDP link/session entities using shared `sidereal-net` protocol registration (`register_lightyear_protocol`), and replication runs the active Avian simulation loop. Gateway bootstrap control handoff remains a dedicated UDP control path.
+- note on codec compatibility: Lightyear message payloads are bincode-encoded by default. Current shard/replication state messages carry `world_json` bytes (JSON-serialized `WorldStateDelta`) inside Lightyear envelopes because `serde_json::Value` in the world-delta schema is not directly bincode-deserializable (`AnyNotSupported`) in this phase.
 
 ### 3.3 WebRTC Transport Architecture (WASM/Browser Client)
 
@@ -183,6 +191,8 @@ path = "src/lib.rs"            # WASM entry point (wasm-bindgen init)
 
 Platform-specific code (transport adapter selection, `wasm-bindgen` init, browser canvas setup) is gated by `#[cfg(target_arch = "wasm32")]`. All gameplay, prediction, reconciliation, UI, and ECS systems live in shared modules with no target conditional.
 
+Native is the current primary delivery target, but WASM is still a parity-gated target. Any client-side gameplay/protocol/runtime behavior change is incomplete unless the WASM path is updated (or confirmed unaffected) in the same change.
+
 Build commands:
 
 ```bash
@@ -192,7 +202,7 @@ cargo build -p sidereal-client
 # WASM (requires wasm-pack or cargo build with wasm32 target)
 wasm-pack build crates/sidereal-client --target web --out-dir ../../dist/web
 # or
-cargo build -p sidereal-client --target wasm32-unknown-unknown
+cargo build -p sidereal-client --target wasm32-unknown-unknown --features bevy/webgpu
 ```
 
 This replaces the previously listed `bins/sidereal-client-web` binary. There is no separate web binary; the WASM artifact comes from the library target of `crates/sidereal-client`.
@@ -303,15 +313,26 @@ Three-scope model:
 2. Authorization scope: what this player may know (ownership, attachments, scan grants).
 3. Delivery scope: what this active client session receives now (focus radius/hysteresis/stream tier).
 
+Enforcement order (mandatory):
+
+1. Build candidate entity set (spatial query + owned/attached inclusion).
+2. Resolve authorization scope per entity (ownership, attachment inheritance, active scan grants).
+3. Resolve delivery scope per active stream/session.
+4. Apply field-level redaction mask before serialization.
+5. Emit additions/updates/removals for the session stream.
+
 Rules:
 
 - Owned entities and owned attachments: full detail for control UI.
-- Non-owned authorized entities: redacted by field policy.
+- Non-owned authorized entities: redacted by field policy (physical/render-safe fields by default).
 - Unauthorized entities: never serialized; explicit removal if previously visible.
+- Authorization and delivery are not equivalent: a player can be authorized for data that the active stream does not currently deliver.
+- Current default delivery behavior: focus stream does not automatically include all offscreen owned entities unless explicitly subscribed via additional stream policy.
 
 Sensitive-data rule:
 
 - cargo internals, hidden loadouts, subsystem internals, private transfer details remain omitted unless explicit gameplay grants allow exposure.
+- transfer payload visibility follows grant/ownership policy: unrelated observers must not receive private transfer detail.
 
 Multi-entity ownership rule:
 
@@ -332,6 +353,7 @@ Server-managed temporary grants keyed by:
 - field scope,
 - source,
 - grant/expiry times.
+- unique grant id.
 
 Example field scopes:
 
@@ -341,6 +363,13 @@ Example field scopes:
 - `cargo_manifest`
 - `systems_detail`
 
+Grant lifecycle requirements:
+
+- grant source is explicit (`active_scan`, `dock_access`, `boarding`, `allied_share`, etc.).
+- grants are time-bounded unless explicitly revoked earlier.
+- on expiry/revocation, visibility reverts immediately to baseline redacted policy.
+- no grant may bypass ownership/authorization identity checks.
+
 ### 7.2 Stream Tiers
 
 Support from ground level:
@@ -349,6 +378,12 @@ Support from ground level:
 - `strategic_stream`: lower-rate minimap contacts/coarse kinematics.
 - `intel_stream`: event-driven grant results and revocations.
 
+Stream security constraints:
+
+- all streams are server-authoritative and permission-filtered.
+- clients can subscribe only to allowed stream types; subscription does not bypass redaction.
+- unauthorized fields are never placed on any stream payload (including minimap/strategic streams).
+
 ### 7.3 Spatial Indexing
 
 Visibility query engine must support sublinear candidate lookup:
@@ -356,47 +391,474 @@ Visibility query engine must support sublinear candidate lookup:
 - phase-1 acceptable: uniform spatial hash grid,
 - future: adaptive grid/quadtree for hotspot density.
 
+Baseline spatial query behavior:
+
+- include nearby cells for focus radius queries.
+- include nearby cells for each owned scanner radius and union candidates.
+- include owned/attachment descendants independently of spatial culling.
+
+Expected complexity target:
+
+- avoid full-world `O(total_entities)` scan per client per tick.
+- practical target is `O(entities_in_candidate_cells + owned_descendants)`.
+
 Metrics required:
 
 - candidate count per client frame,
 - included entity count,
 - query time budget.
 
+Optional later stream extensions:
+
+- low-frequency fleet/strategic panels may be added as explicit subscriptions.
+- extensions must still route through the same authorization + delivery + redaction pipeline.
+
 ## 8. ECS and Gameplay Composition Model
 
 ### 8.1 Philosophy
 
-- Composition over inheritance.
-- Capability components drive behavior.
-- Domain tags classify archetypes only.
+Sidereal uses Bevy ECS for both realtime simulation and authoritative state flow.
 
-### 8.2 Current Baseline Components
+Core principles:
 
-Core implemented/required families:
+- Data-oriented composition over inheritance.
+- Stable entity identity (`EntityGuid` + persistent IDs in storage).
+- Authority is explicit (`ShardAssignment`, lease epoch in protocol).
+- Ownership and control are explicit and separate concerns.
+- Hot simulation state is in-memory ECS; durability is snapshot + event persistence.
+- Behavior is capability-driven. Labels like `Ship`, `Missile`, `Asteroid` are domain tags, not simulation branches.
 
-- Identity: `EntityGuid`, `DisplayName`
-- Kinematics: `PositionM`, `VelocityMps`
-- Physical properties: `MassKg`, `SizeM`, `CollisionAabbM`
-- Authority: `ShardAssignment`
-- Topology/modularity: `Hardpoint`, `MountedOn`
-- Flight: `Engine`, `FuelTank`, `FlightComputer`
-- Ownership/combat: `OwnerKind`, `OwnerId`, `InstigatorEntityId`, `HealthPool`
-- Derived mass pipeline: `BaseMassKg`, `CargoMassKg`, `ModuleMassKg`, `TotalMassKg`, `MassDirty`
+### 8.2 Current Implemented Components
 
-### 8.3 Avian Sync Contract
+Implemented today in `crates/sidereal-game/src/lib.rs`:
+
+- `ShipTag`: optional domain tag for ship-class entities.
+- `ModuleTag`: marks ship module entities.
+- `EntityGuid(Uuid)`: stable global identifier.
+- `DisplayName(String)`: canonical display name mirrored to graph `name` property.
+- `PositionM(Vec3)`: world position in meters.
+- `VelocityMps(Vec3)`: linear velocity in meters/second.
+- `MassKg(f32)`: mass in kilograms.
+- `SizeM { length, width, height }`: physical dimensions in meters.
+- `CollisionAabbM { half_extents }`: collision shape metadata.
+- `ShardAssignment(i32)`: authoritative shard assignment.
+- `Hardpoint { hardpoint_id, offset_m }`: mount point metadata.
+- `MountedOn { parent_entity, parent_entity_id, hardpoint_id }`: module-to-parent relation (parent is any host entity with hardpoints; UUID is the cross-boundary identity).
+- `Engine { thrust_n, burn_rate_kg_s, thrust_dir }`: propulsion module.
+- `FuelTank { fuel_kg }`: remaining fuel.
+- `FlightComputer { profile, throttle }`: fly-by-wire/autopilot controller.
+- `OwnerKind`, `OwnerId`: ownership identity for combat/economy attribution.
+- `InstigatorEntityId`: explicit combat initiator tracing (who fired/caused action).
+- `HealthPool`: durability component for interceptable/damageable entities.
+- `BaseMassKg`, `CargoMassKg`, `ModuleMassKg`, `TotalMassKg`, `MassDirty`: cached mass pipeline.
+- `Warhead`, `GuidanceComputer`, `DamageProfile`, `LifetimeTicks`: modular missile/projectile foundations.
+
+Also wired today:
+
+- Avian physics components: `RigidBody`, `Collider`, `LinearVelocity`, `Position`, `Rotation`.
+
+Physics/render sync rule:
+
+- Avian `Position`/`Rotation` is simulation-authoritative.
+- Bevy `Transform`/`GlobalTransform` is mirrored from Avian each fixed tick for rendering/camera/plugin compatibility.
+- `PositionM`/`VelocityMps` are also updated from authoritative Avian state for persistence/network consistency.
+
+### 8.3 Core Planned Cross-Domain Components
+
+Identity and authority:
+
+- `AuthorityShardId`
+- `LeaseEpoch`
+- `ReplicationVersion`
+
+Ownership/control/security:
+
+- `OwnerKind` (`Player | Faction | World | Unowned`)
+- `OwnerId`
+- `ControllerId`
+- `AccessRights`
+- `FactionAffiliation`
+
+Spatial and visibility:
+
+- `RegionId`
+- `InterestRadius`
+- `VisibilityMask`
+- `SensorProfile`
+- `Signature` (thermal/radar/emission)
+
+Economy/inventory:
+
+- `CargoSlots`
+- `CargoMassKg`
+- `InventoryLedgerRef`
+- `MarketListingRef`
+- `CurrencyWallet`
+
+Combat:
+
+- `HealthPool`
+- `ArmorProfile`
+- `ShieldProfile`
+- `WeaponMount`
+- `ProjectileProfile`
+- `LifetimeTicks`
+- `InstigatorEntityId`
+- `Warhead`
+- `GuidanceComputer`
+
+World simulation:
+
+- `OrbitalBody`
+- `GravitySource`
+- `ResourceField` (asteroid yields, gas density)
+- `BackgroundSimProxy`
+
+Power and utility simulation (planned):
+
+- `PowerProducer` (engines, reactors, solar arrays).
+- `PowerConsumer` (shields, computers, tractor beams, scanners, weapons).
+- `BatteryBank` (stored energy buffer).
+- `PowerBus` (distribution limits and priorities).
+- `FuelConsumer` (engines, missiles).
+- `DockingPort`, `DockedTo`
+- `Scanner`, `RemoteBeaconEmitter`
+
+### 8.4 Relationship Model
+
+Use plain ECS references and composition:
+
+- Parent host entity stores mass/physics/authority.
+- Module entities reference parent via `MountedOn`.
+- Hardpoint IDs define deterministic attachment points.
+- Hardpoints are the universal attachment mechanism for engines, guns, computers, shields, tractor beams, cargo modules, and missile subsystems.
+- Replication sends flattened deltas; storage rebuilds hierarchy by IDs.
+- Cross-boundary relationship identity uses UUID fields (`parent_entity_id`), never Bevy `Entity` IDs.
+
+Modularity rule:
+
+- Behavior should live in module components.
+- Example: missile explosion logic belongs to `Warhead`; guidance logic belongs to `GuidanceComputer`; thrust/fuel logic belongs to `Engine` + `FuelTank`.
+- No gameplay system should branch by "is ship" when capability components are sufficient.
+
+### 8.5 Archetype Examples
+
+#### 8.5.1 Asteroid
+
+- `EntityGuid`
+- `PositionM`, `VelocityMps`
+- `MassKg`, `SizeM`
+- `CollisionAabbM` or sphere collider
+- `HealthPool`
+- `ResourceField` (ore type, richness)
+- `ShardAssignment`, `RegionId`
+
+Behavior:
+
+- Mineable resource depletion via events.
+- Optional rigid body for collisions.
+
+#### 8.5.2 Bullet (kinetic)
+
+- `EntityGuid`
+- `PositionM`, `VelocityMps`
+- `MassKg`
+- `OwnerKind`, `OwnerId`
+- `InstigatorEntityId`
+- `ProjectileProfile` (damage, caliber)
+- `HealthPool` (optional, if interceptable)
+- `LifetimeTicks`
+- `ShardAssignment`
+
+Behavior:
+
+- Short-lived, high-rate entities.
+- Usually no inventory persistence.
+
+#### 8.5.3 Missile
+
+- `EntityGuid`
+- `PositionM`, `VelocityMps`
+- `MassKg`
+- `OwnerKind`, `OwnerId`
+- `InstigatorEntityId`
+- `Engine`, `FuelTank`
+- `GuidanceComputer` (optional: omit for dumb-fire)
+- `Warhead`
+- `DamageProfile`
+- `HealthPool`
+- `LifetimeTicks`
+- `ShardAssignment`
+
+Behavior:
+
+- Server-authoritative homing/thrust.
+- Detonation event on proximity/hit.
+
+#### 8.5.4 Cargo Container
+
+- `EntityGuid`
+- `PositionM`, `VelocityMps`
+- `MassKg`, `SizeM`
+- `CollisionAabbM`
+- `CargoSlots` or `InventoryLedgerRef`
+- `OwnerKind`, `OwnerId`
+- `ShardAssignment`
+
+Behavior:
+
+- Can be dropped, tractored, looted, transferred.
+
+#### 8.5.5 Space Station
+
+- `EntityGuid`
+- `PositionM`
+- `MassKg`, `SizeM`
+- `CollisionAabbM`
+- `DockingPorts`
+- `MarketListingRef`
+- `OwnerKind`, `OwnerId`
+- `FactionAffiliation`
+- `ShardAssignment`, `RegionId`
+
+Behavior:
+
+- Mostly static/kinematic body.
+- Strong economy and mission hooks.
+
+#### 8.5.6 Planet
+
+- `EntityGuid`
+- `PositionM`
+- `SizeM` (radius representation)
+- `GravitySource`
+- `OrbitalBody`
+- `AtmosphereProfile` (optional)
+- `RegionId`
+
+Behavior:
+
+- Usually not dynamic rigid body.
+- Influences nearby entity trajectory and sensors.
+
+#### 8.5.7 Star
+
+- `EntityGuid`
+- `PositionM`
+- `GravitySource`
+- `RadiationProfile`
+- `OrbitalBody` (for system model)
+
+Behavior:
+
+- Dominant gravity and environmental hazard source.
+
+#### 8.5.8 Starter Craft Example (Current Seed)
+
+The seeded prototype ship (`Prospector-14`) composes:
+
+- Hull entity: ship tags, physics, mass/size, shard assignment.
+- Module entities:
+  - one `FlightComputer`
+  - two `Engine + FuelTank`
+- Hardpoints:
+  - `computer_core`
+  - `engine_left_aft`
+  - `engine_right_aft`
+
+This is the baseline pattern for all future player/NPC craft.
+
+### 8.6 Event and Persistence Mapping
+
+Guideline:
+
+- Persist durable domain events (ownership, inventory, economy, destruction).
+- Snapshot hot kinematics periodically.
+- Rebuild runtime ECS world from snapshot + event replay.
+
+Example durable events:
+
+- `EntitySpawned`
+- `ModuleAttached`
+- `FuelConsumed`
+- `ProjectileHit`
+- `CargoTransferred`
+- `EntityDestroyed`
+
+### 8.7 Coding Conventions for Components
+
+- Unit suffixes required (`M`, `Mps`, `Kg`, `N`, `Ticks`).
+- Components should be small and single-purpose.
+- Keep protocol DTOs in `sidereal-net`, not in gameplay component modules.
+- Keep persistence row models in `sidereal-persistence`, not in gameplay modules.
+
+### 8.8 Dynamic vs Generated Stats (Mass Best Practice)
+
+For values like dynamic total mass, use cached derived components, not live recompute on every use.
+
+Recommended pattern:
+
+1. Store source components (`BaseMassKg`, `CargoMassKg`, `ModuleMassKg` on modules).
+2. Mark parent entity `MassDirty` when cargo/modules change.
+3. Recompute once in a system (`TotalMassKg`) and clear `MassDirty`.
+4. Physics systems read `TotalMassKg` only.
+
+Why:
+
+- avoids repeated hot-path aggregation
+- deterministic and replication-friendly
+- scales better with many modules/cargo items
+
+### 8.9 Avian Sync Contract
 
 - Avian `Position`/`Rotation` is simulation-authoritative.
 - Mirror into Bevy `Transform`/`GlobalTransform` each fixed tick.
 - Mirror to network/persistence-facing kinematic components consistently.
+- Avian runtime-only transient components (contacts/manifolds, solver caches, sleeping-island internals, broadphase internals, other non-durable physics runtime artifacts) are not persisted.
+- Durable gameplay state required after restart must be represented in persistable ECS components outside Avian runtime internals.
 
-### 8.4 Capability Rules
+### 8.10 Capability Rules (Must Hold)
 
 Any entity with:
 
-- `HealthPool` can be damaged/destroyed,
-- `Engine + FuelTank` can accelerate/run out of fuel,
-- scanner/beacon components can expand visibility,
-- hardpoints can mount detachable modules/cargo.
+- `HealthPool` can be damaged and destroyed.
+- `Engine` + `FuelTank` can accelerate and can run out of fuel.
+- Power components can produce, consume, and store energy.
+- `ShieldProfile` can trade power for shield mitigation.
+- `FlightComputer` or AI computer can accept intent actions.
+- Scanner/beacon components can extend fog-of-war visibility.
+- Hardpoints can mount detachable modules, including cargo containers.
+
+### 8.11 Action Routing System
+
+The action routing system provides a modular, capability-driven approach to entity input handling and behavior execution.
+
+#### Architecture Flow
+
+```
+Player Input (Keys/Mouse/Gamepad)
+    ↓
+Bindings → EntityAction enum (ThrustForward, FireWeapon, etc.)
+    ↓
+NetworkMessage/LocalQueue → ActionQueue component on controlled entity
+    ↓
+validate_action_capabilities system (warns if entity can't handle action)
+    ↓
+Component-specific handlers route actions to modules
+    ↓
+Module components check constraints (fuel, power, cooldown)
+    ↓
+Module components apply effects via Avian physics (Forces.apply_force(), etc.)
+```
+
+#### Core Components
+
+**`EntityAction` enum** (in `crates/sidereal-game/src/actions.rs`):
+- High-level intent actions (not raw physics)
+- Examples: `ThrustForward`, `ThrustReverse`, `YawLeft`, `YawRight`, `FirePrimary`, `ActivateShield`
+- Extensible for new actions without touching input layer
+
+**`ActionQueue` component**:
+- Attached to entities that receive actions
+- Holds `Vec<EntityAction>` for current tick
+- Cleared/drained each frame
+
+**`ActionCapabilities` component**:
+- Declares which `EntityAction`s an entity can handle
+- Used for validation and UI hints
+- Example: A ship with engines can handle `ThrustForward`/`YawLeft`, but a cargo container cannot
+
+#### Example: Flight Control Chain
+
+1. **Input Layer**: Player presses `W` → bindings produce `EntityAction::ThrustForward`
+2. **Network/Local**: Action sent to controlled entity's `ActionQueue`
+3. **FlightComputer Handler** (`process_flight_actions` system):
+   - Reads `ActionQueue`, matches flight-related actions
+   - Updates `FlightComputer.throttle` to 1.0
+4. **Engine Handler** (`apply_engine_thrust` system):
+   - Queries all `Engine` modules mounted on entities with `FlightComputer`
+   - For each engine:
+     - Check `FuelTank.fuel_kg > 0.0`
+     - If yes: compute thrust force, drain fuel, accumulate force
+     - If no: log fuel exhaustion, skip
+   - Aggregate all engine forces in parent entity's local space
+   - Rotate to world space via `Transform.rotation`
+   - Apply via Avian's `Forces.apply_force(force_world)` query helper
+5. **Avian Integration**: Forces are integrated by Avian's physics step into velocity/position changes
+
+#### Design Invariants
+
+- **No direct velocity manipulation**: Always use `Forces.apply_force()` / `Forces.apply_torque()` so Avian handles mass/inertia/damping correctly
+- **Capability-driven**: Components declare support for actions; no global "is this a ship?" checks
+- **Fuel/power/constraints at handler level**: Input layer doesn't know about fuel; `Engine` component does
+- **Shared for player input, AI commands, scripted sequences**: Same `EntityAction` API works for all command sources
+- **Module hierarchy respected**: Engines mounted via `MountedOn` component, forces applied to parent entity
+- **Deterministic**: Action processing and force application run in `FixedUpdate` schedule
+
+#### Future Extensions
+
+- **Weapon actions**: `FirePrimary`/`FireSecondary` → `WeaponMount` handler → projectile spawn + ammo drain
+- **Shield actions**: `ActivateShield` → `ShieldProfile` handler → power drain + damage mitigation
+- **Utility actions**: `ActivateTractor`, `ActivateScanner` → respective component handlers
+- **Autopilot/AI**: AI systems produce `EntityAction`s instead of raw input, same pipeline
+
+#### Implementation Notes
+
+**Files:**
+- `crates/sidereal-game/src/actions.rs`: `EntityAction` enum, `ActionQueue`, `ActionCapabilities`
+- `crates/sidereal-game/src/flight.rs`: `process_flight_actions`, `apply_engine_thrust`
+- `crates/sidereal-game/src/lib.rs`: System registration in `FixedUpdate` schedule
+
+**System ordering:**
+```rust
+FixedUpdate::chain(
+    validate_action_capabilities,  // Warn about unsupported actions
+    process_flight_actions,         // Actions → FlightComputer state
+    apply_engine_thrust,            // FlightComputer → Engine forces
+)
+```
+
+This runs before Avian's `PhysicsSet::StepSimulation`, ensuring forces are ready for integration.
+
+### 8.12 Component Source-of-Truth and Generation Plan
+
+Root rule:
+
+- Gameplay component definitions are centralized in core (`crates/sidereal-game`) and treated as source-of-truth for runtime, replication, and persistence mapping.
+
+Generation direction:
+
+- Define component schemas in `crates/sidereal-game/schema/components/` (one schema per component family).
+- Generate Rust component definitions/registrations into `crates/sidereal-game/src/generated/components.rs`.
+- Generated output must include derives/metadata needed for:
+  - Bevy ECS registration,
+  - `Reflect`,
+  - serde (`Serialize`/`Deserialize`),
+  - stable persistence metadata (`component_kind`, type path envelope key).
+
+Why this is done at grass roots:
+
+- prevents drift between ECS runtime types and graph persistence mapping,
+- guarantees new components are persistable/hydratable by default unless explicitly runtime-only,
+- creates one extensible path for ships/hardpoints/modules/inventory/combat/scripting-facing components.
+
+Non-generated exceptions:
+
+- Truly runtime/transient components (for example Avian internal runtime state, caches, ephemeral prediction-only helpers) remain hand-authored and explicitly marked non-persisted.
+
+Persistence contract for gameplay ECS components:
+
+- Every gameplay-relevant component that crosses runtime boundaries must support `Reflect` + `Serialize` + `Deserialize`.
+- Persisted component payloads are stored using reflect envelopes keyed by stable Rust type path.
+- New persistable components must include graph mapping tests and hydration roundtrip tests in the same change.
+
+### 8.13 Next ECS Implementation Steps
+
+1. Add ownership/control components and validation systems.
+2. Add `HealthPool`, `ProjectileProfile`, `LifetimeTicks` for combat baseline.
+3. Add inventory/cargo components with persistence mapping.
+4. Add gravity/orbital components for system-scale simulation.
+5. Define archetype bundles per entity class for consistent spawning.
 
 ## 9. Shared Simulation Core (`sidereal-sim-core`)
 
@@ -466,7 +928,7 @@ Runtime init requirements (service startup):
 ### 10.3 Graph Identity Rules
 
 - one logical entity_id => one graph node.
-- labels are additive on same node.
+- AGE persistence uses `:Entity` as the canonical graph label; additional gameplay classifications are stored in `sidereal_labels` and rehydrated into runtime label sets.
 - component ids are stable (for example `<entity_id>::<component_kind>`).
 
 ### 10.4 Canonical Graph Shape
@@ -480,21 +942,29 @@ Edges:
 - `(:Entity)-[:HAS_COMPONENT]->(:Component)`
 - `(:Component)-[:MOUNTED_ON]->(:Hardpoint)`
 - `(:Entity)-[:HAS_HARDPOINT]->(:Hardpoint)`
+- `(:Entity)-[:HAS_CHILD]->(:Entity)` (entity hierarchy / Bevy children relationship)
 - `(:Entity)-[:OWNS]->(:Entity|:Item|:InventorySlot)`
 - `(:InventorySlot)-[:CONTAINS]->(:Item)`
 
 ### 10.5 Persistence Write Flow
 
 1. Shard emits authoritative world deltas.
-2. Replication ingests and persists at configured cadence.
+2. Replication ingests and persists at configured cadence (`REPLICATION_PERSIST_INTERVAL_S`, default `15s`), with immediate flush for removals/critical durability events.
 3. Snapshot markers written periodically.
 4. Critical events are durability candidates for replay semantics.
 
 ### 10.6 Recovery/Hydration
 
 - startup hydration only,
+- on startup, replication hydrates its read-model ECS state from graph persistence before serving client-facing state streams,
 - no periodic DB overwrite into live shard entities,
 - runtime remains shard-authoritative.
+
+### 10.7 Generalized Component Persistence Rules
+
+- Persistence mapping must be generalized for broad component families (ships, hardpoints, mounted modules like engines/flight computers/shield generators, inventory, ownership, hierarchy).
+- Hierarchy/modularity must preserve parent-child and mount relationships in graph edges so hydration can rebuild ECS relationships deterministically.
+- Internal network codecs may use `bincode` (or JSON where configured), but persisted graph payload contracts remain serde-based and backward-compatible.
 
 ## 11. Auth and Identity at the Core
 
@@ -516,7 +986,10 @@ Gateway endpoints:
 - `POST /auth/password-reset/request`
 - `POST /auth/password-reset/confirm`
 - `GET /auth/me`
+- `GET /world/me` (JWT-authenticated player world bootstrap snapshot for client login handoff)
+- `GET /assets/stream/{asset_id}` (JWT-authenticated streaming asset endpoint for client cache population)
 - Asset bootstrap metadata is delivered on the authenticated replication/control channel (not HTTP asset file endpoints).
+- Current scaffold behavior: password reset request returns a reset token in response for local/dev flow verification; production delivery should move to out-of-band mail/SMS and stop returning raw tokens.
 
 ### 11.3 Registration and Starter Ship Bootstrap
 
@@ -524,8 +997,9 @@ Required lifecycle:
 
 1. gateway creates account record and `player_entity_id` (`player:<account_uuid>`),
 2. gateway requests replication bootstrap command,
-3. replication performs world bootstrap in graph if player owns none,
-4. login does not create gameplay entities.
+3. replication persists bootstrap receipt and applies bootstrap idempotently (`account_id` unique; duplicate commands are recorded but not re-applied),
+4. replication performs world bootstrap in graph if player owns none (current scaffold creates starter `Ship` metadata with `asset_id=corvette_01`),
+5. login does not create gameplay entities.
 
 This keeps auth as entry authority and world bootstrap in replication-owned world pipeline.
 
@@ -613,6 +1087,26 @@ Architecture:
 
 - script runtime calls controlled Rust APIs that operate on ECS data,
 - scripts never bypass authority or permission boundaries.
+
+### 14.1 Flight Computer and Scripting Model
+
+Flight-computer direction:
+
+- `FlightComputer` remains a core ECS component in `sidereal-game` data model.
+- Flight-computer behavior is split into:
+  - deterministic control pipeline in Rust (authoritative application of thrust/rotation intent),
+  - optional script policy layer that decides high-level intent.
+
+Script boundary for flight computers:
+
+- scripts may read approved ECS/query views and emit intent-level outputs only (for example target throttle/steering profile/mode),
+- scripts never directly mutate authoritative transforms, velocities, ownership, replication envelopes, or persistence state.
+
+Operational model:
+
+- authoritative script execution is server-side; clients can run non-authoritative mirrors for UX only.
+- script callbacks are budgeted/sandboxed and failure-contained; on failure/time budget exceed, runtime falls back to deterministic Rust defaults.
+- scripted flight-computer profiles are content assets (streamed/versioned like other script bundles), while ECS component state remains persistable through the same reflect+serde graph contract.
 
 ## 15. Multi-Shard and Handoff Design
 
@@ -716,9 +1210,22 @@ Current notable env vars:
 
 - `SIM_TICK_HZ`
 - `REPLICATION_SEND_HZ`
-- `SIDEREAL_UDP_CODEC` (`json` or `bincode`)
+- `REPLICATION_UDP_BIND` default: `0.0.0.0:7001` (Lightyear raw UDP server bind on replication)
+- `REPLICATION_UDP_ADDR` default: `127.0.0.1:7001` (target addr for shard/native Lightyear clients)
+- `SHARD_UDP_BIND` default: `127.0.0.1:7002` (Lightyear shard client local bind)
+- `CLIENT_UDP_BIND` default: `127.0.0.1:7003` (Lightyear native client local bind)
+- `SIDEREAL_CLIENT_HEADLESS` default: unset/false (`1`/`true` runs native client in transport-only headless mode for integration harnesses)
 - `REPLICATION_PERSIST_INTERVAL_S`
 - `SNAPSHOT_INTERVAL_S`
+- `REPLICATION_DATABASE_URL` default: `postgres://sidereal:sidereal@127.0.0.1:5432/sidereal`
+- `GATEWAY_BIND` default: `127.0.0.1:8080`
+- `GATEWAY_DATABASE_URL` default: `postgres://sidereal:sidereal@127.0.0.1:5432/sidereal`
+- `GATEWAY_JWT_SECRET` required; minimum length 32 chars
+- `GATEWAY_ACCESS_TOKEN_TTL_S` default: `900`
+- `GATEWAY_REFRESH_TOKEN_TTL_S` default: `2592000`
+- `GATEWAY_RESET_TOKEN_TTL_S` default: `3600`
+- `GATEWAY_BOOTSTRAP_MODE` default: `direct` (`udp` enables fire-and-forget replication control handoff instead)
+- `GATEWAY_REPLICATION_CONTROL_UDP_BIND` default: `0.0.0.0:0` (gateway local UDP bind for bootstrap handoff send)
 - `GATEWAY_*` visibility and delta thresholds
 - `SIDEREAL_ASSET_ROOT` default: `./data`
 - `SIDEREAL_ASSET_CACHE_DIR` default: `./client_cache/assets`
@@ -778,8 +1285,8 @@ docker exec sidereal-postgres psql -U sidereal -d sidereal -c "LOAD 'age'; SET s
 ### 19.3 Run core services (example)
 
 ```bash
-SIDEREAL_UDP_CODEC=bincode cargo run -p sidereal-replication
-SIDEREAL_UDP_CODEC=bincode cargo run -p sidereal-shard
+REPLICATION_UDP_BIND=0.0.0.0:7001 cargo run -p sidereal-replication
+SHARD_UDP_BIND=127.0.0.1:7002 REPLICATION_UDP_ADDR=127.0.0.1:7001 cargo run -p sidereal-shard
 cargo run -p sidereal-gateway
 ```
 
@@ -905,7 +1412,7 @@ sqlx::query("SET search_path = public;").execute(conn).await?;
 - Graph persistence + startup hydration functioning with no periodic DB->live overwrite.
 - Shared `sidereal-sim-core` used by shard and client prediction path.
 - Asset IDs delivered with placeholder fallback and no gameplay impact from missing assets.
-- Native and WASM clients both build in CI with shared gameplay code and transport-specific adapters only at boundary layers.
+- Native and WASM clients both build in CI with shared gameplay code and transport-specific adapters only at boundary layers; WASM CI validation includes WebGPU-enabled build settings.
 - Baseline docs/decisions/coding standards synchronized with implementation.
 
 ## 24. Compact Glossary

@@ -24,9 +24,21 @@ authors = ["Sidereal Team"]
 
 [workspace.dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = "0.8"
+avian3d = "0.5.0"
+base64 = "0.22"
 bevy = { version = "0.18.0" }
 bevy_remote = "0.18.0"
+lightyear = { version = "0.26.4", features = ["udp", "raw_connection"] }
+jsonwebtoken = "9.3"
+rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
+tokio = "1.48"
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+postgres = { version = "0.19", features = ["with-uuid-1"] }
 uuid = { version = "1.8", features = ["serde", "v4"] }

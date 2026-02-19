@@ -20,7 +20,7 @@ fn main() {
     app.add_plugins(MinimalPlugins);
     configure_remote(&mut app, &remote_cfg);
     app.add_systems(Startup, || {
-        println!("sidereal-shard scaffold");
+        println!("sidereal-shard scaffold (reserved for future multi-shard mode)");
     });
     app.run();
 }
@@ -58,7 +58,10 @@ mod tests {
         app.add_plugins(MinimalPlugins);
         configure_remote(&mut app, &cfg);
 
-        assert!(app.world().contains_resource::<bevy_remote::http::HostPort>());
+        assert!(
+            app.world()
+                .contains_resource::<bevy_remote::http::HostPort>()
+        );
         assert!(app.world().contains_resource::<BrpAuthToken>());
     }
 }

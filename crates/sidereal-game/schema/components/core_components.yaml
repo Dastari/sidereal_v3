@@ -1,0 +1,37 @@
+version: 1
+family: core
+components:
+  - component_kind: entity_guid
+    rust_type: sidereal_game::generated::components::EntityGuid
+    persistable: true
+  - component_kind: display_name
+    rust_type: sidereal_game::generated::components::DisplayName
+    persistable: true
+  - component_kind: position_m
+    rust_type: sidereal_game::generated::components::PositionM
+    persistable: true
+  - component_kind: velocity_mps
+    rust_type: sidereal_game::generated::components::VelocityMps
+    persistable: true
+  - component_kind: shard_assignment
+    rust_type: sidereal_game::generated::components::ShardAssignment
+    persistable: true
+  - component_kind: hardpoint
+    rust_type: sidereal_game::generated::components::Hardpoint
+    persistable: true
+  - component_kind: mounted_on
+    rust_type: sidereal_game::generated::components::MountedOn
+    persistable: true
+  - component_kind: engine
+    rust_type: sidereal_game::generated::components::Engine
+    persistable: true
+  - component_kind: fuel_tank
+    rust_type: sidereal_game::generated::components::FuelTank
+    persistable: true
+  - component_kind: flight_computer
+    rust_type: sidereal_game::generated::components::FlightComputer
+    persistable: true
+    script_policy: intent_only
+  - component_kind: health_pool
+    rust_type: sidereal_game::generated::components::HealthPool
+    persistable: true

@@ -5,7 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+lightyear_protocol = ["dep:bevy", "dep:lightyear"]
+
 [dependencies]
+bevy = { workspace = true, optional = true }
+lightyear = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sidereal-core = { path = "../sidereal-core" }
+sidereal-game = { path = "../sidereal-game" }
